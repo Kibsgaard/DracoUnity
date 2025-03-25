@@ -13,8 +13,8 @@ namespace Draco
     /// </summary>
     public sealed class BoneWeightData : IDisposable
     {
-        NativeArray<byte> m_BonesPerVertex;
-        NativeArray<BoneWeight1> m_BoneWeights;
+        public NativeArray<byte> bonesPerVertex;
+        public NativeArray<BoneWeight1> boneWeights;
 
         /// <summary>
         /// Constructs an object with parameters identical to <see cref="Mesh.SetBoneWeights"/>.
@@ -24,8 +24,8 @@ namespace Draco
         /// <seealso cref="Mesh.SetBoneWeights"/>
         public BoneWeightData(NativeArray<byte> bonesPerVertex, NativeArray<BoneWeight1> boneWeights)
         {
-            m_BonesPerVertex = bonesPerVertex;
-            m_BoneWeights = boneWeights;
+            this.bonesPerVertex = bonesPerVertex;
+            this.boneWeights = boneWeights;
         }
 
         /// <summary>
@@ -34,7 +34,7 @@ namespace Draco
         /// <param name="mesh">The mesh to apply the data onto.</param>
         public void ApplyOnMesh(Mesh mesh)
         {
-            mesh.SetBoneWeights(m_BonesPerVertex, m_BoneWeights);
+            mesh.SetBoneWeights(bonesPerVertex, boneWeights);
         }
 
         /// <summary>
@@ -42,8 +42,8 @@ namespace Draco
         /// </summary>
         public void Dispose()
         {
-            m_BonesPerVertex.Dispose();
-            m_BoneWeights.Dispose();
+            bonesPerVertex.Dispose();
+            boneWeights.Dispose();
         }
     }
 }

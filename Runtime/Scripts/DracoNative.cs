@@ -68,6 +68,11 @@ namespace Draco
 
         Mesh.MeshData m_Mesh;
         int m_IndicesCount;
+        private readonly int m_SubMeshIndex;
+        private int[] m_VertexIntervals;
+        private int[] m_IndicesIntervals;
+        private readonly bool m_SetupBuffers = true;
+        private Bounds? m_Bounds;
 
         // START BLEND-HACK
         // TODO: Unity does not support setting bone weights and indices via new Mesh API
@@ -77,8 +82,7 @@ namespace Draco
         AttributeMap m_BoneIndexMap;
         AttributeMap m_BoneWeightMap;
         public bool hasBoneWeightData => m_BoneIndexMap != null && m_BoneWeightMap != null;
-        public NativeArray<byte> bonesPerVertex;
-        public NativeArray<BoneWeight1> boneWeights;
+        public BoneWeightData boneWeightData;
         // END BLEND-HACK
 
         public DracoNative(
@@ -88,6 +92,19 @@ namespace Draco
         {
             m_DecodeSettings = decodeSettings;
             m_Mesh = mesh;
+        }
+
+        public DracoNative(Mesh.MeshData mesh, DecodeSettings decodeSettings, int subMeshIndex, int[] vertexIntervals,
+            int[] indicesIntervals, Bounds? bounds, BoneWeightData boneWeightData)
+        {
+            m_DecodeSettings = decodeSettings;
+            m_Mesh = mesh;
+            m_SubMeshIndex = subMeshIndex;
+            m_VertexIntervals = vertexIntervals;
+            m_IndicesIntervals = indicesIntervals;
+            m_SetupBuffers = subMeshIndex == 0;
+            m_Bounds = bounds;
+            this.boneWeightData = boneWeightData;
         }
 
         public JobHandle Init(IntPtr encodedData, int size)
@@ -231,6 +248,11 @@ namespace Draco
                 decodeVerticesJobHandle.Complete();
             }
 #endif
+            
+            var indicesOffset = m_IndicesIntervals[m_SubMeshIndex];
+            var indicesLength = m_IndicesIntervals[m_SubMeshIndex + 1] - indicesOffset;
+            var vertOffset = m_VertexIntervals[m_SubMeshIndex];
+            var vertLength = m_VertexIntervals[m_SubMeshIndex + 1] - vertOffset;
 
             JobHandle indicesJob;
             var dracoMeshJobCount = m_Attributes.Count;
@@ -239,7 +261,9 @@ namespace Draco
             {
                 indicesJob = new GeneratePointCloudIndicesJob
                 {
-                    mesh = m_Mesh
+                    mesh = m_Mesh,
+                    indicesOffset = indicesOffset,
+                    indicesLength = indicesLength
                 }.Schedule();
             }
             else
@@ -250,7 +274,9 @@ namespace Draco
                     dracoTempResources = m_DracoTempResources,
                     flip = (m_DecodeSettings & DecodeSettings.ConvertSpace) != 0,
                     dataType = m_Mesh.indexFormat == IndexFormat.UInt16 ? DataType.UInt16 : DataType.UInt32,
-                    mesh = m_Mesh
+                    mesh = m_Mesh,
+                    indicesOffset = indicesOffset,
+                    indicesLength = indicesLength
                 }.Schedule(decodeVerticesJobHandle);
                 dracoMeshJobCount++;
             }
@@ -281,7 +307,8 @@ namespace Draco
                 // weights were removed from attributes before
                 if (map.attribute == VertexAttribute.BlendIndices) continue; // Blend
 
-                var calculateBound = map.attribute == VertexAttribute.Position;
+
+                var calculateBound = map.attribute == VertexAttribute.Position && !m_Bounds.HasValue;
                 if (calculateBound)
                 {
                     Assert.IsFalse(m_PositionMinMax.IsCreated, "Multiple position attributes are not supported");
@@ -305,6 +332,8 @@ namespace Draco
                             streamIndex = map.stream,
                             offset = map.offset,
                             bounds = m_PositionMinMax,
+                            vertOffset = vertOffset,
+                            vertLength = vertLength
                         };
                         jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
                     }
@@ -321,6 +350,8 @@ namespace Draco
                             mesh = m_Mesh,
                             streamIndex = map.stream,
                             offset = map.offset,
+                            vertOffset = vertOffset,
+                            vertLength = vertLength
                         };
                         jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
                     }
@@ -339,6 +370,8 @@ namespace Draco
                             mesh = m_Mesh,
                             streamIndex = map.stream,
                             bounds = m_PositionMinMax,
+                            vertOffset = vertOffset,
+                            vertLength = vertLength,
                         };
                         jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
                     }
@@ -353,6 +386,8 @@ namespace Draco
                             componentStride = map.numComponents,
                             mesh = m_Mesh,
                             streamIndex = map.stream,
+                            vertOffset = vertOffset,
+                            vertLength = vertLength
                         };
                         jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
                     }
@@ -374,8 +409,9 @@ namespace Draco
                     dracoTempResources = m_DracoTempResources,
                     indicesAttribute = m_BoneIndexMap.dracoAttribute,
                     weightsAttribute = m_BoneWeightMap.dracoAttribute,
-                    bonesPerVertex = bonesPerVertex,
-                    boneWeights = boneWeights,
+                    bonesPerVertex = boneWeightData.bonesPerVertex,
+                    boneWeights = boneWeightData.boneWeights,
+                    boneOffset = vertOffset,
                     indexValueConverter = GetIndexValueConverter(m_BoneIndexMap.format)
                 };
                 jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
@@ -426,29 +462,45 @@ namespace Draco
 
             Profiler.BeginSample("SetParameters");
             m_IsPointCloud = dracoMesh->isPointCloud;
+            m_IndicesCount = m_IsPointCloud ? dracoMesh->numVertices : dracoMesh->numFaces * 3;
 
-            if (m_IsPointCloud)
+            // The first submesh will setup the entire mesh buffer.
+            if (m_SetupBuffers)
             {
-                m_IndicesCount = dracoMesh->numVertices;
-                m_Mesh.SetIndexBufferParams(dracoMesh->numVertices, dracoMesh->indexFormat);
+                m_VertexIntervals ??= new[] { 0, dracoMesh->numVertices };
+                m_IndicesIntervals ??= new[] { 0, m_IndicesCount };
+                
+                var totalVertCount = m_VertexIntervals[m_VertexIntervals.Length - 1];
+                var totalIndicesCount = m_IndicesIntervals[m_IndicesIntervals.Length - 1];
+                if (m_IsPointCloud)
+                {
+                    m_Mesh.SetIndexBufferParams(totalVertCount, dracoMesh->indexFormat);
+                }
+                else
+                {
+                    m_Mesh.SetIndexBufferParams(totalIndicesCount, dracoMesh->indexFormat);
+                }
+
+                var vertexParams = new List<VertexAttributeDescriptor>(m_Attributes.Count);
+                foreach (var map in m_Attributes)
+                {
+                    vertexParams.Add(map.GetVertexAttributeDescriptor());
+                }
+
+                m_Mesh.SetVertexBufferParams(totalVertCount, vertexParams.ToArray());
+                
+                m_Mesh.subMeshCount = m_VertexIntervals.Length - 1;
+                
+                if (hasBoneWeightData)
+                {
+                    var boneCount = m_BoneIndexMap.numComponents;
+                    var boneAllocator = totalVertCount > k_PersistentDataThreshold ? Allocator.Persistent : Allocator.TempJob;
+                    var bonesPerVertex = new NativeArray<byte>(totalVertCount, boneAllocator);
+                    var boneWeights = new NativeArray<BoneWeight1>(totalVertCount * boneCount, boneAllocator);
+                    boneWeightData = new BoneWeightData(bonesPerVertex, boneWeights);
+                }
             }
-            else
-            {
-                m_IndicesCount = dracoMesh->numFaces * 3;
-                m_Mesh.SetIndexBufferParams(dracoMesh->numFaces * 3, dracoMesh->indexFormat);
-            }
-            var vertexParams = new List<VertexAttributeDescriptor>(m_Attributes.Count);
-            foreach (var map in m_Attributes)
-            {
-                vertexParams.Add(map.GetVertexAttributeDescriptor());
-            }
-            m_Mesh.SetVertexBufferParams(dracoMesh->numVertices, vertexParams.ToArray());
-            if (hasBoneWeightData)
-            {
-                var boneCount = m_BoneIndexMap.numComponents;
-                bonesPerVertex = new NativeArray<byte>(dracoMesh->numVertices, m_Allocator);
-                boneWeights = new NativeArray<BoneWeight1>(dracoMesh->numVertices * boneCount, m_Allocator);
-            }
+            
             Profiler.EndSample(); // SetParameters
             Profiler.EndSample(); // CreateMesh
         }
@@ -471,10 +523,8 @@ namespace Draco
             return bounds;
         }
 
-        public bool
-        PopulateMeshData(Bounds bounds)
+        public bool PopulateMeshData(out Bounds bounds)
         {
-
             Profiler.BeginSample("PopulateMeshData");
 
             foreach (var map in m_Attributes)
@@ -485,19 +535,21 @@ namespace Draco
 
             Profiler.BeginSample("MeshAssign");
 
+            bounds = m_Bounds ?? CreateBounds();
             const MeshUpdateFlags flags = DracoDecoder.defaultMeshUpdateFlags;
-
-            m_Mesh.subMeshCount = 1;
             var subMeshDescriptor = new SubMeshDescriptor(
-                0,
+                m_IndicesIntervals[m_SubMeshIndex],
                 m_IndicesCount,
                 m_IsPointCloud ? MeshTopology.Points : MeshTopology.Triangles
                 )
             {
-                vertexCount = m_Mesh.vertexCount,
+                baseVertex = m_VertexIntervals[m_SubMeshIndex],
+                vertexCount = m_VertexIntervals[m_SubMeshIndex + 1] - m_VertexIntervals[m_SubMeshIndex],
+                firstVertex = m_VertexIntervals[m_SubMeshIndex],
                 bounds = bounds
             };
-            m_Mesh.SetSubMesh(0, subMeshDescriptor, flags);
+            m_Mesh.SetSubMesh(m_SubMeshIndex, subMeshDescriptor, flags);
+            
             Profiler.EndSample(); // CreateUnityMesh.CreateMesh
             Profiler.EndSample();
 
@@ -1042,7 +1094,6 @@ namespace Draco
         [BurstCompile]
         struct DecodeVerticesJob : IJob
         {
-
             public NativeArray<int> result;
             public NativeArray<IntPtr> dracoTempResources;
 
@@ -1064,7 +1115,6 @@ namespace Draco
         [BurstCompile]
         struct GetDracoIndicesJob : IJob
         {
-
             [ReadOnly]
             public NativeArray<int> result;
             [ReadOnly]
@@ -1073,6 +1123,10 @@ namespace Draco
             public bool flip;
             [ReadOnly]
             public DataType dataType;
+            [ReadOnly]
+            public int indicesOffset;
+            [ReadOnly]
+            public int indicesLength;
             public Mesh.MeshData mesh;
 
             public void Execute()
@@ -1084,28 +1138,24 @@ namespace Draco
                 var dracoMesh = (DracoMesh*)dracoTempResources[k_MeshPtrIndex];
                 Assert.IsFalse(dracoMesh->isPointCloud);
                 void* indicesPtr;
-                int indicesLength;
 
                 switch (dataType)
                 {
                     case DataType.UInt16:
                         {
-                            var indices = mesh.GetIndexData<ushort>();
-                            indicesPtr = indices.GetUnsafePtr();
-                            indicesLength = indices.Length;
+                            indicesPtr = (ushort*)mesh.GetIndexData<ushort>().GetUnsafePtr() + indicesOffset;
                             break;
                         }
                     case DataType.UInt32:
                         {
-                            var indices = mesh.GetIndexData<uint>();
-                            indicesPtr = indices.GetUnsafePtr();
-                            indicesLength = indices.Length;
+                            indicesPtr = (uint*)mesh.GetIndexData<uint>().GetUnsafePtr() + indicesOffset;
                             break;
                         }
                     default:
                         result[0] = -1;
                         return;
                 }
+
                 GetMeshIndices(dracoMesh, dataType, indicesPtr, indicesLength, flip);
             }
         }
@@ -1114,6 +1164,11 @@ namespace Draco
         struct GeneratePointCloudIndicesJob : IJob
         {
             public Mesh.MeshData mesh;
+            
+            [ReadOnly]
+            public int indicesOffset;
+            [ReadOnly]
+            public int indicesLength;
 
             public void Execute()
             {
@@ -1122,18 +1177,18 @@ namespace Draco
                     case IndexFormat.UInt16:
                         {
                             var indices = mesh.GetIndexData<ushort>();
-                            for (var i = 0; i < indices.Length; i++)
+                            for (var i = 0; i < indicesLength; i++)
                             {
-                                indices[i] = (ushort)i;
+                                indices[i + indicesOffset] = (ushort)i;
                             }
                             break;
                         }
                     case IndexFormat.UInt32:
                         {
                             var indices = mesh.GetIndexData<uint>();
-                            for (var i = 0; i < indices.Length; i++)
+                            for (var i = 0; i < indicesLength; i++)
                             {
-                                indices[i] = (uint)i;
+                                indices[i + indicesOffset] = (uint)i;
                             }
                             break;
                         }
@@ -1163,6 +1218,11 @@ namespace Draco
             public Mesh.MeshData mesh;
             [ReadOnly]
             public int streamIndex;
+            
+            [ReadOnly]
+            public int vertOffset;
+            [ReadOnly]
+            public int vertLength;
 
             public void Execute()
             {
@@ -1175,8 +1235,8 @@ namespace Draco
                 GetAttributeData(dracoMesh, attribute, &data, flip, componentStride);
                 var elementSize = DataTypeSize((DataType)data->dataType) * componentStride;
                 var dst = mesh.GetVertexData<byte>(streamIndex);
-                var dstPtr = dst.GetUnsafePtr();
-                UnsafeUtility.MemCpy(dstPtr, (void*)data->data, elementSize * dracoMesh->numVertices);
+                var dstPtr = (byte*)dst.GetUnsafePtr() + vertOffset * elementSize;
+                UnsafeUtility.MemCpy(dstPtr, (void*)data->data, elementSize * vertLength);
                 ReleaseDracoData(&data);
             }
         }
@@ -1206,6 +1266,11 @@ namespace Draco
 
             public NativeArray<float3> bounds;
 
+            [ReadOnly]
+            public int vertOffset;
+            [ReadOnly]
+            public int vertLength;
+            
             public void Execute()
             {
                 if (result[0] < 0)
@@ -1217,8 +1282,8 @@ namespace Draco
                 GetAttributeData(dracoMesh, attribute, &data, flip, componentStride);
                 var elementSize = DataTypeSize((DataType)data->dataType) * componentStride;
                 var dst = mesh.GetVertexData<byte>(streamIndex);
-                var dstPtr = dst.GetUnsafePtr();
-                for (var v = 0; v < dracoMesh->numVertices; v++)
+                var dstPtr = (byte*)dst.GetUnsafePtr() + vertOffset * elementSize;
+                for (var v = 0; v < vertLength; v++)
                 {
                     var value = *(float3*)((byte*)data->data + elementSize * v);
                     bounds[0] = math.min(bounds[0], value);
@@ -1258,6 +1323,11 @@ namespace Draco
 
             [ReadOnly]
             public int offset;
+            
+            [ReadOnly]
+            public int vertOffset;
+            [ReadOnly]
+            public int vertLength;
 
             public void Execute()
             {
@@ -1270,8 +1340,8 @@ namespace Draco
                 GetAttributeData(dracoMesh, attribute, &data, flip, componentStride);
                 var elementSize = DataTypeSize((DataType)data->dataType) * componentStride;
                 var dst = mesh.GetVertexData<byte>(streamIndex);
-                var dstPtr = ((byte*)dst.GetUnsafePtr()) + offset;
-                for (var v = 0; v < dracoMesh->numVertices; v++)
+                var dstPtr = ((byte*)dst.GetUnsafePtr()) + offset + vertOffset * stride;
+                for (var v = 0; v < vertLength; v++)
                 {
                     UnsafeUtility.MemCpy(dstPtr + (stride * v), ((byte*)data->data) + (elementSize * v), elementSize);
                 }
@@ -1311,6 +1381,11 @@ namespace Draco
             public int offset;
 
             public NativeArray<float3> bounds;
+            
+            [ReadOnly]
+            public int vertOffset;
+            [ReadOnly]
+            public int vertLength;
 
             public void Execute()
             {
@@ -1323,8 +1398,8 @@ namespace Draco
                 GetAttributeData(dracoMesh, attribute, &data, flip, componentStride);
                 var elementSize = DataTypeSize((DataType)data->dataType) * componentStride;
                 var dst = mesh.GetVertexData<byte>(streamIndex);
-                var dstPtr = ((byte*)dst.GetUnsafePtr()) + offset;
-                for (var v = 0; v < dracoMesh->numVertices; v++)
+                var dstPtr = ((byte*)dst.GetUnsafePtr()) + offset + vertOffset * stride;
+                for (var v = 0; v < vertLength; v++)
                 {
                     var value = *(float3*)((byte*)data->data + elementSize * v);
                     bounds[0] = math.min(bounds[0], value);
@@ -1355,6 +1430,9 @@ namespace Draco
             [ReadOnly]
             [NativeDisableUnsafePtrRestriction]
             public DracoAttribute* weightsAttribute;
+            
+            [ReadOnly]
+            public int boneOffset;
 
             [WriteOnly]
             public NativeArray<byte> bonesPerVertex;
@@ -1380,12 +1458,12 @@ namespace Draco
 
                 for (var v = 0; v < dracoMesh->numVertices; v++)
                 {
-                    bonesPerVertex[v] = (byte)indicesAttribute->numComponents;
+                    bonesPerVertex[v + boneOffset] = (byte)indicesAttribute->numComponents;
                     var indicesPtr = (IntPtr)(((byte*)indicesData->data) + (indexSize * v));
                     var weightsPtr = (float*)(((byte*)weightsData->data) + (weightSize * v));
                     for (var b = 0; b < indicesAttribute->numComponents; b++)
                     {
-                        boneWeights[v * indicesAttribute->numComponents + b] = new BoneWeight1
+                        boneWeights[(v + boneOffset) * indicesAttribute->numComponents + b] = new BoneWeight1
                         {
                             boneIndex = indexValueConverter.Invoke(indicesPtr, b),
                             weight = *(weightsPtr + b)

@@ -157,6 +157,86 @@ namespace Draco
             return await DecodeMesh(encodedData, decodeSettings, null);
         }
 
+        public static async Task<Mesh> DecodeMesh(
+            NativeSlice<byte>[] encodedDataArray,
+            DecodeSettings decodeSettings,
+            Dictionary<VertexAttribute, int>[] attributeIdMaps,
+            int[] vertexIntervals,
+            int[] indicesIntervals,
+            Bounds?[] bounds
+        )
+        {
+            CertifySupportedPlatform(
+#if UNITY_EDITOR
+                false
+#endif
+            );
+
+            var meshDataArray = Mesh.AllocateWritableMeshData(1);
+            var mesh = meshDataArray[0];
+            Bounds? combinedBounds = null;
+            bool calculateNormals = false;
+            BoneWeightData boneWeightData = null;
+            
+            for (var i = 0; i < encodedDataArray.Length; i++)
+            {
+                var encodedData = encodedDataArray[i];
+                var attributeIdMap = attributeIdMaps[i];
+                var encodedDataPtr = GetUnsafeReadOnlyIntPtr(encodedData);
+                
+                var result = await DecodeMesh(
+                    mesh,
+                    encodedDataPtr,
+                    encodedData.Length,
+                    decodeSettings,
+                    attributeIdMap,
+                    i,
+                    vertexIntervals,
+                    indicesIntervals,
+                    bounds,
+                    boneWeightData
+                );
+                if (!result.success)
+                {
+                    meshDataArray.Dispose();
+                    return null;
+                }
+                
+                boneWeightData = result.boneWeightData;
+                
+                if (combinedBounds == null)
+                    combinedBounds = result.bounds;
+                else
+                    combinedBounds.Value.Encapsulate(result.bounds);
+
+                calculateNormals |= result.calculateNormals;
+            }
+            
+            var unityMesh = new Mesh();
+            Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, unityMesh);
+            unityMesh.bounds = combinedBounds.Value;
+            if (boneWeightData != null)
+            {
+                boneWeightData.ApplyOnMesh(unityMesh);
+                boneWeightData.Dispose();
+            }
+            
+            if (unityMesh.GetTopology(0) == MeshTopology.Triangles)
+            {
+                if (calculateNormals)
+                {
+                    unityMesh.RecalculateNormals();
+                }
+            
+                if ((decodeSettings & DecodeSettings.RequireTangents) != 0)
+                {
+                    unityMesh.RecalculateTangents();
+                }
+            }
+
+            return unityMesh;
+        }
+
         /// <inheritdoc cref="DecodeMesh(NativeSlice{byte},DecodeSettings)"/>
         /// <param name="attributeIdMap">Attribute type to index map</param>
         public static async Task<Mesh> DecodeMesh(
@@ -291,7 +371,7 @@ namespace Draco
                 decodeSettings,
                 attributeIdMap
 #if UNITY_EDITOR
-                ,sync
+                , sync: sync
 #endif
             );
             UnsafeUtility.ReleaseGCObject(gcHandle);
@@ -320,13 +400,18 @@ namespace Draco
             IntPtr encodedData,
             int size,
             DecodeSettings decodeSettings,
-            Dictionary<VertexAttribute, int> attributeIdMap
+            Dictionary<VertexAttribute, int> attributeIdMap,
+            int submeshIndex = 0,
+            int[] vertexIntervals = null,
+            int[] indicesIntervals = null,
+            Bounds?[] bounds = null,
+            BoneWeightData boneWeightData = null
 #if UNITY_EDITOR
             ,bool sync = false
 #endif
         )
         {
-            var dracoNative = new DracoNative(meshData, decodeSettings);
+            var dracoNative = new DracoNative(meshData, decodeSettings, submeshIndex, vertexIntervals, indicesIntervals, bounds?[submeshIndex], boneWeightData);
 
 #if UNITY_EDITOR
             if (sync) {
@@ -363,19 +448,12 @@ namespace Draco
                 return new DecodeResult();
             }
 
-            var bounds = dracoNative.CreateBounds();
-            var success = dracoNative.PopulateMeshData(bounds);
-            BoneWeightData boneWeightData = null;
-            if (success && dracoNative.hasBoneWeightData)
-            {
-                boneWeightData = new BoneWeightData(dracoNative.bonesPerVertex, dracoNative.boneWeights);
-                dracoNative.DisposeBoneWeightData();
-            }
+            var success = dracoNative.PopulateMeshData(out var subMeshBounds);
             return new DecodeResult(
                 success,
-                bounds,
+                subMeshBounds,
                 calculateNormals,
-                boneWeightData
+                dracoNative.boneWeightData
                 );
         }
 
