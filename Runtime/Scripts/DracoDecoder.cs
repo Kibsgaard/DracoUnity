@@ -174,7 +174,7 @@ namespace Draco
 
             var meshDataArray = Mesh.AllocateWritableMeshData(1);
             var mesh = meshDataArray[0];
-            Bounds? combinedBounds = null;
+            Bounds combinedBounds = default;
             bool calculateNormals = false;
             BoneWeightData boneWeightData = null;
             
@@ -204,17 +204,17 @@ namespace Draco
                 
                 boneWeightData = result.boneWeightData;
                 
-                if (combinedBounds == null)
+                if (i == 0)
                     combinedBounds = result.bounds;
                 else
-                    combinedBounds.Value.Encapsulate(result.bounds);
+                    combinedBounds.Encapsulate(result.bounds);
 
                 calculateNormals |= result.calculateNormals;
             }
             
             var unityMesh = new Mesh();
             Mesh.ApplyAndDisposeWritableMeshData(meshDataArray, unityMesh);
-            unityMesh.bounds = combinedBounds.Value;
+            unityMesh.bounds = combinedBounds;
             if (boneWeightData != null)
             {
                 boneWeightData.ApplyOnMesh(unityMesh);
