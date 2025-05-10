@@ -139,11 +139,10 @@ namespace Draco
             return m_DracoDecodeResult[0] < 0;
         }
 
-        void CalculateVertexParams(
-            DracoMesh* dracoMesh,
+        void CalculateVertexParams(DracoMesh* dracoMesh,
             Dictionary<VertexAttribute, int> attributeIdMap,
-            out bool calculateNormals
-            )
+            bool canFitIn16BitBuffer,
+            out bool calculateNormals)
         {
             Profiler.BeginSample("CalculateVertexParams");
 
@@ -171,7 +170,7 @@ namespace Draco
             // on performance. Therefore we stick to Unity's layout (which
             // combines pos+normal+tangent in one stream) for smaller meshes.
             // See: https://github.com/atteneder/glTFast/issues/197
-            forceUnityVertexLayout |= dracoMesh->numVertices <= ushort.MaxValue;
+            forceUnityVertexLayout |= canFitIn16BitBuffer;
 
             foreach (var attributeMap in m_Attributes)
             {
@@ -409,11 +408,12 @@ namespace Draco
                     dracoTempResources = m_DracoTempResources,
                     indicesAttribute = m_BoneIndexMap.dracoAttribute,
                     weightsAttribute = m_BoneWeightMap.dracoAttribute,
-                    bonesPerVertex = boneWeightData.bonesPerVertex,
-                    boneWeights = boneWeightData.boneWeights,
                     boneOffset = vertOffset,
                     indexValueConverter = GetIndexValueConverter(m_BoneIndexMap.format)
                 };
+
+                boneWeightData.AssignToJob(ref job);
+
                 jobHandles[jobIndex] = job.Schedule(decodeVerticesJobHandle);
             }
 
@@ -454,32 +454,31 @@ namespace Draco
             var dracoMesh = (DracoMesh*)m_DracoTempResources[k_MeshPtrIndex];
             m_Allocator = dracoMesh->numVertices > k_PersistentDataThreshold ? Allocator.Persistent : Allocator.TempJob;
 
+            m_IsPointCloud = dracoMesh->isPointCloud;
+            m_IndicesCount = m_IsPointCloud ? dracoMesh->numVertices : dracoMesh->numFaces * 3;
+
+            m_VertexIntervals ??= new[] { 0, dracoMesh->numVertices };
+            m_IndicesIntervals ??= new[] { 0, m_IndicesCount };
+
+            var totalVertCount = m_VertexIntervals[m_VertexIntervals.Length - 1];
+            var canFitIn16BitBuffer = totalVertCount < ushort.MaxValue; // Max value is excluded because it is reserved in some Graphics APIs for triggering primitive restart (https://github.com/KhronosGroup/glTF/issues/1142#issuecomment-433717774)
+
             CalculateVertexParams(
                 dracoMesh,
                 attributeIdMap,
+                canFitIn16BitBuffer,
                 out calculateNormals
                 );
 
             Profiler.BeginSample("SetParameters");
-            m_IsPointCloud = dracoMesh->isPointCloud;
-            m_IndicesCount = m_IsPointCloud ? dracoMesh->numVertices : dracoMesh->numFaces * 3;
 
             // The first submesh will setup the entire mesh buffer.
             if (m_SetupBuffers)
             {
-                m_VertexIntervals ??= new[] { 0, dracoMesh->numVertices };
-                m_IndicesIntervals ??= new[] { 0, m_IndicesCount };
-                
-                var totalVertCount = m_VertexIntervals[m_VertexIntervals.Length - 1];
-                var totalIndicesCount = m_IndicesIntervals[m_IndicesIntervals.Length - 1];
-                if (m_IsPointCloud)
-                {
-                    m_Mesh.SetIndexBufferParams(totalVertCount, dracoMesh->indexFormat);
-                }
-                else
-                {
-                    m_Mesh.SetIndexBufferParams(totalIndicesCount, dracoMesh->indexFormat);
-                }
+                var totalIndicesCount = m_IsPointCloud ? totalVertCount : m_IndicesIntervals[m_IndicesIntervals.Length - 1];
+                var indexFormat = canFitIn16BitBuffer ? IndexFormat.UInt16 : IndexFormat.UInt32;
+
+                m_Mesh.SetIndexBufferParams(totalIndicesCount, indexFormat);
 
                 var vertexParams = new List<VertexAttributeDescriptor>(m_Attributes.Count);
                 foreach (var map in m_Attributes)
@@ -623,7 +622,7 @@ namespace Draco
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        struct DracoAttribute
+        internal struct DracoAttribute
         {
             // ReSharper disable MemberCanBePrivate.Local
             public int attributeType;
@@ -641,8 +640,6 @@ namespace Draco
             // ReSharper disable once MemberCanBePrivate.Local
             public int numAttributes;
             public bool isPointCloud;
-
-            public IndexFormat indexFormat => numVertices >= ushort.MaxValue ? IndexFormat.UInt32 : IndexFormat.UInt16;
         }
 
         /// <summary>
@@ -1411,7 +1408,7 @@ namespace Draco
         }
 
         [BurstCompile]
-        struct GetDracoBonesJob : IJob
+        internal struct GetDracoBonesJob : IJob
         {
 
             public delegate int GetIndexValueDelegate(IntPtr baseAddress, int index);
